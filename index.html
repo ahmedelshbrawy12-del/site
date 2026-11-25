@@ -258,38 +258,81 @@ const toNum=t=>{t=String(t).trim().replace(/[٠-٩]/g,d=>'٠١٢٣٤٥٦٧٨٩'.
 const loadScript=u=>new Promise((ok,no)=>{const e=document.createElement('script');e.src=u;e.onload=ok;e.onerror=()=>no(new Error('تعذر تحميل مكتبة القراءة. تأكد من الإنترنت.'));document.head.appendChild(e)});
 const libs={};
 function lib(k,u,chk){return libs[k]||(libs[k]=(chk()?Promise.resolve():loadScript(u)).catch(e=>{libs[k]=null;throw e}))}
-/* صف خلايا -> {name,qty,unit} أو null */
+const HNAME=/^(اسم|الاسم|الصنف|البند|الخامه|الخامة|الخامات|المادة|المادة|البيان|الوصف|اسم الخامه|اسم الخامة|اسم الصنف|اسم المادة|name|item|items|material|description|desc|item name|material name)$/i;
+const HQTY=/^(الكمية|الكميه|كمية|كميه|العدد|qty|quantity|total|الاجمالي|الإجمالي)$/i;
+const HUNIT=/^(الوحدة|الوحده|وحدة|وحده|unit|uom)$/i;
+const HOTHER=/^(م|#|no\.?|رقم|مسلسل|serial|sr|s\/n|ملاحظات|ملاحظه|ملاحظة|note|notes|remarks)$/i;
+const HDR=new RegExp(HNAME.source+'|'+HQTY.source+'|'+HUNIT.source+'|'+HOTHER.source,'i');
+const UNITS={'no':'عدد','no.':'عدد','nr':'عدد','pcs':'قطعة','pc':'قطعة','ea':'عدد','m':'متر','m.':'متر','lm':'متر','mtr':'متر','m1':'متر','set':'طقم','kg':'كجم','ls':'مقطوعية','m2':'م²','m3':'م³'};
+const mapUnit=u=>{const k=String(u||'').trim().toLowerCase();return UNITS[k]||String(u||'').trim()};
+const isNumTok=c=>!isNaN(toNum(c));
+const cl1=c=>String(c==null?'':c).replace(/\s+/g,' ').trim();
+/* صف خلايا بدون ترويسة -> {name,qty,unit} أو null */
 function parseCells(cells){
-  cells=cells.map(c=>String(c==null?'':c).trim()).filter(c=>c!=='');
+  cells=cells.map(cl1).filter(c=>c!=='');
   if(!cells.length)return null;
   if(cells.length===1){
     const m=cells[0].match(/^(.*?\p{L}.*?)[\s:\-–|=×x*]+([0-9٠-٩][0-9٠-٩.,٫٬]*)\s*(\p{L}[\p{L}.\/²³0-9]*)?\s*$/u);
     if(!m)return null;cells=[m[1],m[2]].concat(m[3]?[m[3]]:[]);
   }
-  const isN=c=>!isNaN(toNum(c));
+  const isN=isNumTok;
   let idx=cells.map((c,i)=>isN(c)?i:-1).filter(i=>i>=0);
   if(idx.length>=2&&idx[0]===0&&cells.length>idx.length){cells=cells.slice(1);idx=cells.map((c,i)=>isN(c)?i:-1).filter(i=>i>=0)}
   if(!idx.length)return null;
   const qi=idx[0],q=toNum(cells[qi]);
-  const txt=cells.filter((c,i)=>!isN(c)&&/\p{L}/u.test(c));
-  if(!txt.length||!(q>0))return null;
   const nameC=cells.findIndex((c,i)=>!isN(c)&&/\p{L}/u.test(c));
-  const name=cells[nameC].replace(/\s+/g,' ').trim();
-  const unit=(txt.find((c,i)=>c!==cells[nameC])||'').trim();
-  return {name,qty:q,unit};
+  if(nameC<0||!(q>0))return null;
+  const unit=cells.find((c,i)=>i!==nameC&&!isN(c)&&/\p{L}/u.test(c))||'';
+  return {name:cells[nameC],qty:q,unit:mapUnit(unit)};
 }
-const HDR=/^(اسم|الاسم|الصنف|البند|الخامه|الخامة|المادة|البيان|الكمية|الكميه|العدد|الوحدة|الوحده|م|#|name|item|material|qty|quantity|unit|description|no\.?)$/i;
-/* rows: مصفوفة صفوف من الخلايا -> {parsed,failed} */
+/* سطر PDF (عناصر نصية بمواضعها) -> {name,qty,unit} | null (بدون أرقام) | {err} */
+function parsePdfLine(its){
+  const toks=its.map(i=>cl1(i.s)).filter(Boolean);
+  if(!toks.length)return null;
+  const nums=toks.map((t,i)=>isNumTok(t)?i:-1).filter(i=>i>=0);
+  if(!nums.length)return null;
+  const ui=toks.findIndex(t=>/^(no\.?|nr|pcs?|ea|m|m\.|lm|mtr|m1|m2|m3|set|kg|ls|عدد|متر|قطعة|طقم)$/i.test(t));
+  let name,unit='',qi=nums[nums.length-1];
+  if(ui>0){name=toks.slice(0,ui).join(' ');unit=toks[ui];const after=nums.filter(i=>i>ui);if(!after.length)return {err:'لا توجد كمية بعد الوحدة'};qi=after[after.length-1]}
+  else{const f=nums[0];if(f===0)return {err:'رقم بدون اسم'};name=toks.slice(0,f).join(' ');if(nums.length<2&&qi===f){}}
+  const q=toNum(toks[qi]);
+  if(!/\p{L}/u.test(name))return {err:'لا يوجد اسم'};
+  if(!(q>0))return {err:'الكمية صفر أو غير صالحة'};
+  return {name,qty:q,unit:mapUnit(unit)};
+}
+/* rows: صفوف خلايا أو {pdf:[items]} -> {parsed,failed:[{t,why}]} */
 function extractRows(rows){
-  const parsed=[];let failed=0;
-  for(const cells of rows){
-    const cl=cells.map(c=>String(c==null?'':c).trim()).filter(c=>c!=='');
-    if(!cl.length)continue;
-    const p=parseCells(cl);
+  const parsed=[],failed=[];
+  let cm=null; /* خريطة الأعمدة من الترويسة */
+  for(const row of rows){
+    if(row&&row.pdf){
+      const p=parsePdfLine(row.pdf);
+      if(p===null)continue;
+      if(p.err){failed.push({t:row.pdf.map(i=>i.s).join(' ').replace(/\s+/g,' ').trim(),why:p.err});continue}
+      parsed.push(p);continue;
+    }
+    const raw=row.map(c=>c==null?'':c);
+    const cells=raw.map(cl1);
+    if(!cells.some(c=>c!==''))continue;
+    /* ترويسة؟ */
+    const hn=cells.findIndex(c=>HNAME.test(c)),hq=cells.findIndex(c=>HQTY.test(c));
+    if(hn>=0&&hq>=0){cm={n:hn,q:hq,u:cells.findIndex(c=>HUNIT.test(c))};continue}
+    const txt=cells.filter(c=>c!=='').join(' | ');
+    if(cm){
+      const nm=cells[cm.n]||'',qv=cells[cm.q]||'',un=cm.u>=0?cells[cm.u]:'';
+      if(nm===''&&qv==='')continue;
+      if(nm===''){failed.push({t:txt,why:'لا يوجد اسم'});continue}
+      if(qv===''){failed.push({t:txt,why:'لا توجد كمية'});continue}
+      const q=toNum(qv);
+      if(isNaN(q)){failed.push({t:txt,why:'الكمية ليست رقمًا'});continue}
+      if(!(q>0)){failed.push({t:txt,why:'الكمية صفر'});continue}
+      parsed.push({name:nm,qty:q,unit:mapUnit(un)});continue;
+    }
+    const p=parseCells(cells);
     if(p){parsed.push(p);continue}
-    if(parsed.length===0)continue;               /* عنوان أو صف رؤوس قبل أول بيان */
-    if(cl.every(c=>HDR.test(c)))continue;
-    failed++;
+    if(parsed.length===0)continue;
+    if(cells.filter(c=>c!=='').every(c=>HDR.test(c)))continue;
+    failed.push({t:txt,why:'لم أجد اسمًا وكمية'});
   }
   return {parsed,failed};
 }
@@ -321,33 +364,39 @@ async function readFileRows(file){
       const tc=await (await pdf.getPage(p)).getTextContent(),lines=[];
       tc.items.filter(it=>it.str&&it.str.trim()).forEach(it=>{
         const y=it.transform[5],x=it.transform[4],w=it.width||0;
-        let ln=lines.find(l=>Math.abs(l.y-y)<3);if(!ln){ln={y,its:[]};lines.push(ln)}ln.its.push({x,w,s:it.str});
+        let ln=lines.find(l=>Math.abs(l.y-y)<2.5);if(!ln){ln={y,its:[]};lines.push(ln)}ln.its.push({x,w,s:it.str});
       });
-      lines.sort((a,b)=>b.y-a.y).forEach(ln=>{
-        ln.its.sort((a,b)=>a.x-b.x);const cells=[];let cur='',end=null;
-        ln.its.forEach(it=>{if(end!==null&&it.x-end>8){cells.push(cur);cur=''}cur+=(cur&&it.x-end>1.5?' ':'')+it.s;end=it.x+it.w});
-        cells.push(cur);rows.push(cells);
-      });
+      lines.sort((a,b)=>b.y-a.y).forEach(ln=>{ln.its.sort((a,b)=>a.x-b.x);rows.push({pdf:ln.its})});
     }
     return rows;
   }
   throw new Error('نوع الملف غير مدعوم. استخدم PDF أو Excel أو Word.');
+}
+function showSkipped(fl){
+  let b=document.getElementById('impskip');
+  if(!b){b=document.createElement('div');b.id='impskip';b.className='box';b.style.cssText='margin-top:10px;border:1px solid var(--bad,#c33)';
+    document.getElementById('impf').parentNode.parentNode.appendChild(b)}
+  if(!fl.length){b.remove();return}
+  const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  b.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center"><b>صفوف لم تُستورد ('+fl.length+')</b><button class="b" onclick="this.closest(\'#impskip\').remove()">إغلاق</button></div>'
+   +fl.slice(0,10).map(x=>'<div dir="auto" style="margin-top:6px;font-size:13px">'+esc(x.t.slice(0,120))+' <span style="opacity:.7">— '+esc(x.why)+'</span></div>').join('')
+   +(fl.length>10?'<div style="margin-top:6px;opacity:.7">و '+(fl.length-10)+' صف آخر</div>':'');
 }
 async function importList(inp){
   const file=inp.files&&inp.files[0];inp.value='';
   if(!file||!can.recv())return;
   toast('جاري قراءة الملف...');
   try{
-    const {parsed,failed:f0}=extractRows(await readFileRows(file));
-    let failed=f0;
+    const {parsed,failed:fl}=extractRows(await readFileRows(file));
+    let failed=fl.length;showSkipped(fl);
     if(!parsed.length)return toast('لم أجد خامات وكميات في الملف.'+(failed?' صفوف متجاهلة: '+failed:''));
     /* خريطة الأصناف الحالية */
     const map={};S.items.forEach(i=>{map[normN(i.name)]={id:i.id,name:i.name,unit:i.unit||''}});
     let addedEx=0,created=0;
     for(let o=0;o<parsed.length;o+=150){
       const chunk=parsed.slice(o,o+150),agg={},newRefs={};
-      chunk.forEach(r=>{const k=normN(r.name);if(!k){failed++;return}
-        if(!map[k]&&!can.stock()){failed++;return}   /* إنشاء صنف جديد للمخزن/المدير فقط */
+      chunk.forEach(r=>{const k=normN(r.name);if(!k){failed++;fl.push({t:r.name,why:'اسم غير صالح'});showSkipped(fl);return}
+        if(!map[k]&&!can.stock()){failed++;fl.push({t:r.name,why:'صنف جديد (إنشاؤه للمخزن أو المدير فقط)'});showSkipped(fl);return}   /* إنشاء صنف جديد للمخزن/المدير فقط */
         const a=agg[k]||(agg[k]={name:r.name,unit:r.unit,qty:0,rows:[]});a.qty=num(a.qty+r.qty);a.rows.push(r);if(!a.unit&&r.unit)a.unit=r.unit});
       const keys=Object.keys(agg);if(!keys.length)continue;
       const done=await runTransaction(db,async tx=>{
